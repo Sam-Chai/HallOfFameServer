@@ -146,6 +146,8 @@ export class CreatorAuthorizationGuard implements CanActivate {
     const creatorId = params.get('id');
     const provider = params.get('provider');
     const hwid = params.get('hwid');
+    const minecraftAccessToken = params.get('minecraftAccessToken')?.trim() || undefined;
+    const minecraftPlayerUuid = params.get('minecraftPlayerUuid')?.trim() || undefined;
 
     assert(
       creatorName?.length || creatorName === null,
@@ -154,12 +156,30 @@ export class CreatorAuthorizationGuard implements CanActivate {
 
     assert(creatorId?.length, `Creator ID must be a non-empty string.`);
 
-    assert(
-      provider == 'paradox' || provider == 'local',
-      `Provider must be either "paradox" or "local".`
-    );
+    const allowedProviders = new Set([
+      'paradox',
+      'local',
+      'minecraft_official',
+      'minecraft_offline'
+    ]);
+
+    assert(provider && allowedProviders.has(provider), `Unsupported creator provider.`);
 
     assert(hwid?.length, `HWID must be a non-empty string.`);
+
+    if (provider == 'minecraft_official') {
+      assert(
+        minecraftAccessToken?.length,
+        `Minecraft access token must be provided for minecraft_official provider.`
+      );
+    }
+
+    if (provider == 'minecraft_offline') {
+      assert(
+        minecraftPlayerUuid?.length,
+        `Minecraft player UUID must be provided for minecraft_offline provider.`
+      );
+    }
 
     return {
       kind: 'mod',
@@ -167,7 +187,9 @@ export class CreatorAuthorizationGuard implements CanActivate {
       creatorId: creatorId as CreatorId,
       creatorIdProvider: provider,
       hwid: hwid as HardwareId,
-      ip
+      ip,
+      minecraftAccessToken,
+      minecraftPlayerUuid
     };
   }
 }

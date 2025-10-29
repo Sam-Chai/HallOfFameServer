@@ -49,6 +49,12 @@ export const config = {
     dsn: getString('HOF_SENTRY_DSN')
   },
 
+  minecraftAuth: {
+    profileUrl:
+      getOptionalString('HOF_MINECRAFT_SERVICES_PROFILE_URL') ??
+      'https://api.minecraftservices.com/minecraft/profile'
+  },
+
   screenshots: {
     maxFileSizeBytes: getNumber('HOF_SCREENSHOTS_MAX_FILE_SIZE_MB') * 1000 * 1000,
     jpegQuality: getNumber('HOF_SCREENSHOTS_JPEG_QUALITY'),
@@ -97,6 +103,10 @@ function getNumber(envVar: string): number {
 
 function getString(envVar: string): string {
   return getValue(envVar);
+}
+
+function getOptionalString(envVar: string): string | undefined {
+  return process.env[envVar] ?? undefined;
 }
 
 function getValue(envVar: string): string {

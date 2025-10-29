@@ -5,6 +5,7 @@ import { BanService } from './ban.service';
 import { CreatorService } from './creator.service';
 import { DateFnsLocalizationService } from './date-fns-localization.service';
 import { FavoriteService } from './favorite.service';
+import { MinecraftAuthService } from './minecraft-auth.service';
 import { PrismaService } from './prisma.service';
 import { ScreenshotService } from './screenshot.service';
 import { ScreenshotProcessingService } from './screenshot-processing.service';
@@ -19,6 +20,7 @@ export * from './ban.service';
 export * from './creator.service';
 export * from './date-fns-localization.service';
 export * from './favorite.service';
+export * from './minecraft-auth.service';
 export * from './prisma.service';
 export * from './screenshot.service';
 export * from './screenshot-processing.service';
@@ -32,6 +34,7 @@ export const services: Provider[] = [
   AzureService,
   BanService,
   CreatorService,
+  MinecraftAuthService,
   DateFnsLocalizationService,
   FavoriteService,
   PrismaService,

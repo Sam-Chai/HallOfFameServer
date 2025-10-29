@@ -15,6 +15,11 @@ import {
 import { config } from '../config';
 import { AiTranslatorService } from './ai-translator.service';
 import { PrismaService } from './prisma.service';
+import {
+  MinecraftAuthError,
+  MinecraftAuthInvalidUuidError,
+  MinecraftAuthService
+} from './minecraft-auth.service';
 
 export type CreatorAuthorization = SimpleCreatorAuthorization | ModCreatorAuthorization;
 
@@ -45,6 +50,8 @@ export type ModCreatorAuthorization = Readonly<{
   creatorIdProvider: Creator['creatorIdProvider'];
   hwid: HardwareId;
   ip: IpAddress;
+  minecraftAccessToken?: string;
+  minecraftPlayerUuid?: string;
 }>;
 
 /**
@@ -58,6 +65,9 @@ export class CreatorService {
   @Inject(AiTranslatorService)
   private readonly aiTranslator!: AiTranslatorService;
 
+  @Inject(MinecraftAuthService)
+  private readonly minecraftAuth!: MinecraftAuthService;
+
   private readonly logger = new Logger(CreatorService.name);
 
   /**
@@ -67,13 +77,9 @@ export class CreatorService {
    * @see authenticateCreatorForMod
    */
   public async authenticateCreator(authorization: CreatorAuthorization): Promise<Creator> {
-    // Validate the Creator ID.
-    if (!uuid.validate(authorization.creatorId) || uuid.version(authorization.creatorId) != 4) {
-      throw new InvalidCreatorIdError(authorization.creatorId);
-    }
-
     switch (authorization.kind) {
       case 'simple':
+        this.ensureValidCreatorId(authorization.creatorId);
         return await this.authenticateCreatorSimple(authorization);
       case 'mod':
         return await this.authenticateCreatorForMod(authorization);
@@ -150,30 +156,99 @@ export class CreatorService {
    */
   // biome-ignore lint/complexity/noExcessiveLinesPerFunction: it's long, but better that way.
   public async authenticateCreatorForModUnsafe({
-    creatorId,
+    creatorId: rawCreatorId,
     creatorIdProvider,
     creatorName,
     hwid,
-    ip
+    ip,
+    minecraftAccessToken,
+    minecraftPlayerUuid
   }: ModCreatorAuthorization): Promise<Creator> {
     // Note: we do NOT validate the Creator Name immediately, as we need to support legacy
     // Creator Names that were validated with a different regex.
     // We validate it only when an account is created or updated.
 
-    // Find the creator by either the Creator ID or the Creator Name.
-    // If we find a match,
-    // - If the Creator ID is incorrect (not a UUID), reject request.
-    // - If the Creator ID is correct, we'll update the Creator Name if it changed.
-    // If we don't find a match, create a new account.
-    const creatorNameSlug = this.getCreatorNameSlug(creatorName);
+    let effectiveCreatorId = rawCreatorId;
+    let effectiveCreatorName = creatorName;
+    let effectiveMinecraftPlayerUuid: string | null = null;
+
+    switch (creatorIdProvider) {
+      case 'minecraft_official': {
+        if (!minecraftAccessToken?.trim()) {
+          throw new MissingMinecraftOfficialAccessTokenError();
+        }
+
+        try {
+          const profile = await this.minecraftAuth.verifyOfficialAccount({
+            accessToken: minecraftAccessToken
+          });
+          effectiveCreatorId = profile.uuid;
+          effectiveMinecraftPlayerUuid = profile.uuid;
+          if (!effectiveCreatorName && profile.username) {
+            effectiveCreatorName = profile.username;
+          }
+        } catch (error) {
+          if (error instanceof MinecraftAuthError) {
+            throw new MinecraftOfficialAuthenticationError(error);
+          }
+
+          throw error;
+        }
+
+        break;
+      }
+
+      case 'minecraft_offline': {
+        if (!minecraftPlayerUuid?.trim()) {
+          throw new MissingMinecraftOfflinePlayerUuidError();
+        }
+
+        try {
+          effectiveMinecraftPlayerUuid = this.minecraftAuth.normalizeUuid(minecraftPlayerUuid);
+        } catch (error) {
+          if (error instanceof MinecraftAuthInvalidUuidError) {
+            throw new InvalidMinecraftPlayerUuidError(minecraftPlayerUuid);
+          }
+
+          throw error;
+        }
+        break;
+      }
+
+      case 'paradox':
+      case 'local':
+        break;
+
+      default:
+        throw new UnsupportedCreatorIdProviderError(creatorIdProvider);
+    }
+
+    this.ensureValidCreatorId(effectiveCreatorId);
+
+    const creatorNameSlug = this.getCreatorNameSlug(effectiveCreatorName);
+    const searchConditions = [
+      { creatorId: effectiveCreatorId }
+    ];
+
+    if (effectiveCreatorName) {
+      searchConditions.push(
+        { creatorName: effectiveCreatorName },
+        { creatorNameSlug }
+      );
+    }
+
+    if (effectiveMinecraftPlayerUuid) {
+      searchConditions.push({ minecraftPlayerUuid: effectiveMinecraftPlayerUuid });
+    }
 
     const creators = await this.prisma.creator.findMany({
-      where: creatorName
-        ? {
-            // biome-ignore lint/style/useNamingConvention: lib
-            OR: [{ creatorId }, { creatorName }, { creatorNameSlug }]
-          }
-        : { creatorId }
+      where:
+        searchConditions.length > 1
+          ? {
+              // biome-ignore lint/style/useNamingConvention: prisma query
+              OR: searchConditions
+            }
+          : searchConditions[0]
     });
 
     // This can happen if we matched an existing Creator ID (so far so good) but that the
@@ -185,25 +260,68 @@ export class CreatorService {
         `Only two creators are returned, otherwise there are non-unique Creator Names.`
       );
 
-      assert(creatorName, `Creator Name can only be non-null if >1 creators are found.`);
+      assert(
+        effectiveCreatorName,
+        `Creator Name can only be non-null if >1 creators are found.`
+      );
 
-      throw new IncorrectCreatorIdError(creatorName);
+      throw new IncorrectCreatorIdError(effectiveCreatorName);
     }
 
     // After this previous check we know that the first and only creator is the one we want to
     // authenticate or create.
     const creator = creators[0];
 
-    return creator ? updateCreator.call(this) : createCreator.call(this);
+    return creator
+      ? updateCreator.call(this, {
+          effectiveCreatorId,
+          effectiveCreatorName,
+          effectiveMinecraftPlayerUuid,
+          creatorNameSlug,
+          hwid,
+          ip,
+          creatorIdProvider
+        })
+      : createCreator.call(this, {
+          effectiveCreatorId,
+          effectiveCreatorName,
+          effectiveMinecraftPlayerUuid,
+          creatorNameSlug,
+          hwid,
+          ip,
+          creatorIdProvider
+        });
 
-    async function createCreator(this: CreatorService): Promise<Creator> {
+    interface CreatorContext {
+      effectiveCreatorId: string;
+      effectiveCreatorName: string | null;
+      effectiveMinecraftPlayerUuid: string | null;
+      creatorNameSlug: string | null;
+      hwid: HardwareId;
+      ip: IpAddress;
+      creatorIdProvider: Creator['creatorIdProvider'];
+    }
+
+    async function createCreator(
+      this: CreatorService,
+      {
+        effectiveCreatorId,
+        effectiveCreatorName,
+        effectiveMinecraftPlayerUuid,
+        creatorNameSlug,
+        hwid,
+        ip,
+        creatorIdProvider
+      }: CreatorContext
+    ): Promise<Creator> {
       // Create a new creator.
       const newCreator = await this.prisma.creator.create({
         data: {
-          creatorId,
+          creatorId: effectiveCreatorId,
           creatorIdProvider,
-          creatorName: CreatorService.validateCreatorName(creatorName),
+          creatorName: CreatorService.validateCreatorName(effectiveCreatorName),
           creatorNameSlug,
+          minecraftPlayerUuid: effectiveMinecraftPlayerUuid,
           hwids: [hwid],
           ips: [ip],
           socials: []
@@ -217,11 +335,30 @@ export class CreatorService {
       return newCreator;
     }
 
-    async function updateCreator(this: CreatorService): Promise<Creator> {
+    async function updateCreator(
+      this: CreatorService,
+      {
+        effectiveCreatorId,
+        effectiveCreatorName,
+        effectiveMinecraftPlayerUuid,
+        creatorNameSlug,
+        hwid,
+        ip,
+        creatorIdProvider
+      }: CreatorContext
+    ): Promise<Creator> {
       assert(creator);
 
       // Check if the Creator ID match, unless the reset flag is set.
-      if (creator.creatorId != creatorId && !creator.allowCreatorIdReset) {
+      const isSameMinecraftPlayer =
+        effectiveMinecraftPlayerUuid &&
+        creator.minecraftPlayerUuid == effectiveMinecraftPlayerUuid;
+
+      if (
+        creator.creatorId != effectiveCreatorId &&
+        !creator.allowCreatorIdReset &&
+        !isSameMinecraftPlayer
+      ) {
         // This should never happen, as when we enter this condition, it means that we matched
         // on the Creator Name and not the Creator ID.
         assert(creator.creatorName);
@@ -230,11 +367,13 @@ export class CreatorService {
       }
 
       const modified =
-        creator.creatorName != creatorName ||
+        creator.creatorName != effectiveCreatorName ||
         creator.creatorNameSlug != creatorNameSlug ||
         creator.hwids[0] != hwid ||
         creator.ips[0] != ip ||
-        creator.creatorId != creatorId;
+        creator.creatorId != effectiveCreatorId ||
+        creator.minecraftPlayerUuid != effectiveMinecraftPlayerUuid ||
+        creator.creatorIdProvider != creatorIdProvider;
 
       if (!modified) {
         return creator;
@@ -246,13 +385,14 @@ export class CreatorService {
         data: {
           creatorName:
             // Validate the Creator Name if it changed.
-            creator.creatorName == creatorName
-              ? creatorName
-              : CreatorService.validateCreatorName(creatorName),
+            creator.creatorName == effectiveCreatorName
+              ? effectiveCreatorName
+              : CreatorService.validateCreatorName(effectiveCreatorName),
           creatorNameSlug,
           allowCreatorIdReset: false,
-          creatorId,
+          creatorId: effectiveCreatorId,
           creatorIdProvider,
+          minecraftPlayerUuid: effectiveMinecraftPlayerUuid,
           hwids: Array.from(new Set([hwid, ...creator.hwids])).slice(0, 3),
           ips: Array.from(new Set([ip, ...creator.ips])).slice(0, 3)
         }
@@ -368,6 +508,12 @@ export class CreatorService {
     };
   }
 
+  private ensureValidCreatorId(creatorId: string): void {
+    if (!uuid.validate(creatorId) || uuid.version(creatorId) != 4) {
+      throw new InvalidCreatorIdError(creatorId);
+    }
+  }
+
   /**
    * Trims start, end and consecutive spaces and validates that the string does not exceed 25
    * characters.
@@ -397,6 +543,48 @@ export class InvalidCreatorIdError extends CreatorError {
     super(`Invalid Creator ID "${creatorId}", an UUID v4 sequence was expected.`);
 
     this.creatorId = creatorId;
+  }
+}
+
+export class MissingMinecraftOfficialAccessTokenError extends CreatorError {
+  public constructor() {
+    super(`Missing Minecraft official access token in Authorization payload.`);
+  }
+}
+
+export class MissingMinecraftOfflinePlayerUuidError extends CreatorError {
+  public constructor() {
+    super(`Missing Minecraft offline player UUID in Authorization payload.`);
+  }
+}
+
+export class InvalidMinecraftPlayerUuidError extends CreatorError {
+  public readonly value: string;
+
+  public constructor(value: string) {
+    super(`Invalid Minecraft player UUID "${value}".`);
+
+    this.value = value;
+  }
+}
+
+export class UnsupportedCreatorIdProviderError extends CreatorError {
+  public readonly provider: string;
+
+  public constructor(provider: string) {
+    super(`Unsupported creator ID provider "${provider}".`);
+
+    this.provider = provider;
+  }
+}
+
+export class MinecraftOfficialAuthenticationError extends CreatorError {
+  public readonly cause: MinecraftAuthError;
+
+  public constructor(cause: MinecraftAuthError) {
+    super(cause.message);
+
+    this.cause = cause;
   }
 }
 
